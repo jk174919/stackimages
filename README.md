@@ -10,6 +10,7 @@ A local Streamlit app for batch-stacking raster bands **2, 3, and 4** into three
 - Keeps stack order fixed as Band 2, Band 3, Band 4.
 - Uses Band 2's grid as the output grid and aligns Bands 3 and 4 when their georeferencing differs.
 - Builds internal GeoTIFF overviews at the selected pyramid levels.
+- Uses larger buffered writes and GDAL multithreading to speed up stacking and overview generation.
 - Skips an existing output unless **Overwrite an existing** is enabled.
 
 Incomplete groups and groups with multiple files for the same band are shown for review and not processed.
@@ -38,6 +39,8 @@ The app opens in your browser. Add folders with the folder picker or paste one f
 - **Resampling if grids differ**: choose nearest, bilinear, or cubic resampling for alignment to Band 2.
 - **Pyramid resampling**: choose how overview pixels are calculated.
 - **Overview pyramid levels**: select reduction factors from 2× through 32×.
+- **Processing threads**: use all CPU cores or limit GDAL to 4, 2, or 1 worker threads.
+- **GeoTIFF compression**: choose a codec or disable compression for faster writes and larger files. ZSTD can be faster and smaller, but older GIS software may not support it.
 - **Output NoData override**: optionally set a common NoData value for the stack.
 - **Overwrite**: replace a stack that already exists.
 
