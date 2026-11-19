@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +12,8 @@ import numpy as np
 import rasterio
 import streamlit as st
 from rasterio.enums import Resampling
-from rasterio.warp import reproject
-from rasterio.windows import Window, transform as window_transform
+from rasterio.vrt import WarpedVRT
+from rasterio.windows import Window
 
 
 APP_TITLE = "Raster Band Stack + Pyramids"
@@ -26,6 +28,7 @@ SUPPORTED_EXTENSIONS = {
     ".asc",
 }
 OVERVIEW_CHOICES = [2, 4, 8, 16, 32]
+IO_WINDOW_SIZE = 2048
 
 # Recognizes common names such as *_B2.tif, *_B02.jp2, *_BAND_2.tif,
 # and Band3.tif. The band marker is removed to create a scene grouping key.
@@ -145,6 +148,7 @@ def _stack_scene(
     overview_resampling_name: str,
     overview_levels: list[int],
     compression: str,
+    worker_threads: str,
     overwrite: bool,
     nodata_override: float | None,
 ) -> tuple[str, str]:
@@ -153,106 +157,119 @@ def _stack_scene(
     if output_path.exists() and not overwrite:
         return "Skipped", f"Already exists: {output_path.name}"
 
-    datasets: dict[int, rasterio.io.DatasetReader] = {}
     temp_path: Path | None = None
     try:
-        for band in (2, 3, 4):
-            datasets[band] = rasterio.open(record["bands"][band][0])
-        reference = datasets[2]
-        if any(dataset.count < 1 for dataset in datasets.values()):
-            raise ValueError("A source raster has no readable first band.")
+        with rasterio.Env(GDAL_NUM_THREADS=worker_threads):
+            with ExitStack() as stack:
+                datasets = {
+                    band: stack.enter_context(rasterio.open(record["bands"][band][0]))
+                    for band in (2, 3, 4)
+                }
+                reference = datasets[2]
+                if any(dataset.count < 1 for dataset in datasets.values()):
+                    raise ValueError("A source raster has no readable first band.")
 
-        output_dtype = np.result_type(*[np.dtype(dataset.dtypes[0]) for dataset in datasets.values()])
-        output_nodata = _convert_nodata(
-            nodata_override if nodata_override is not None else reference.nodata,
-            output_dtype,
-        )
-        for band in (3, 4):
-            source = datasets[band]
-            if not _grid_matches(source, reference) and (source.crs is None or reference.crs is None):
-                raise ValueError(
-                    f"Band {band} does not share Band 2's grid and one or both rasters lack a CRS. "
-                    "Add matching georeferencing or align these bands before stacking."
+                output_dtype = np.result_type(*[np.dtype(dataset.dtypes[0]) for dataset in datasets.values()])
+                output_nodata = _convert_nodata(
+                    nodata_override if nodata_override is not None else reference.nodata,
+                    output_dtype,
                 )
+                grid_matches = {band: _grid_matches(datasets[band], reference) for band in (2, 3, 4)}
+                for band in (3, 4):
+                    source = datasets[band]
+                    if not grid_matches[band] and (source.crs is None or reference.crs is None):
+                        raise ValueError(
+                            f"Band {band} does not share Band 2's grid and one or both rasters lack a CRS. "
+                            "Add matching georeferencing or align these bands before stacking."
+                        )
 
-        profile: dict[str, Any] = {
-            "driver": "GTiff",
-            "width": reference.width,
-            "height": reference.height,
-            "count": 3,
-            "dtype": output_dtype.name,
-            "crs": reference.crs,
-            "transform": reference.transform,
-            "nodata": output_nodata,
-            "tiled": True,
-            "blockxsize": 512,
-            "blockysize": 512,
-            "bigtiff": "IF_SAFER",
-        }
-        if compression != "none":
-            profile["compress"] = compression
-            profile["predictor"] = 3 if output_dtype.kind == "f" else 2
-
-        file_descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{output_path.stem}_",
-            suffix=".tif",
-            dir=str(folder),
-        )
-        os.close(file_descriptor)
-        temp_path = Path(temp_name)
-        resampling = getattr(Resampling, resampling_name)
-        with rasterio.open(temp_path, "w", **profile) as destination:
-            for row_offset in range(0, reference.height, 512):
-                for column_offset in range(0, reference.width, 512):
-                    window = Window(
-                        column_offset,
-                        row_offset,
-                        min(512, reference.width - column_offset),
-                        min(512, reference.height - row_offset),
-                    )
-                    destination_transform = window_transform(window, reference.transform)
-                    for output_index, band in enumerate((2, 3, 4), start=1):
-                        source = datasets[band]
-                        if _grid_matches(source, reference):
-                            array = source.read(1, window=window, out_dtype=output_dtype.name)
-                        else:
-                            array = np.zeros(
-                                (int(window.height), int(window.width)), dtype=output_dtype
-                            )
-                            reproject(
-                                source=rasterio.band(source, 1),
-                                destination=array,
-                                src_transform=source.transform,
-                                src_crs=source.crs,
-                                src_nodata=source.nodata,
-                                dst_transform=destination_transform,
-                                dst_crs=reference.crs,
-                                dst_nodata=output_nodata,
+                resampling = getattr(Resampling, resampling_name)
+                read_sources: dict[int, Any] = {2: reference}
+                for band in (3, 4):
+                    if grid_matches[band]:
+                        read_sources[band] = datasets[band]
+                    else:
+                        read_sources[band] = stack.enter_context(
+                            WarpedVRT(
+                                datasets[band],
+                                crs=reference.crs,
+                                transform=reference.transform,
+                                width=reference.width,
+                                height=reference.height,
                                 resampling=resampling,
+                                nodata=output_nodata,
+                                dtype=output_dtype.name,
                             )
-                        destination.write(array, output_index, window=window)
-            for index, band in enumerate((2, 3, 4), start=1):
-                destination.set_band_description(index, f"Band {band}")
-            destination.update_tags(
-                source_bands="2,3,4",
-                stack_order="Band 2, Band 3, Band 4",
-                pyramid_resampling=overview_resampling_name,
-            )
-            valid_levels = [level for level in overview_levels if max(reference.width, reference.height) >= level]
-            if valid_levels:
-                destination.build_overviews(
-                    valid_levels,
-                    getattr(Resampling, overview_resampling_name),
+                        )
+
+                profile: dict[str, Any] = {
+                    "driver": "GTiff",
+                    "width": reference.width,
+                    "height": reference.height,
+                    "count": 3,
+                    "dtype": output_dtype.name,
+                    "crs": reference.crs,
+                    "transform": reference.transform,
+                    "nodata": output_nodata,
+                    "tiled": True,
+                    "blockxsize": 512,
+                    "blockysize": 512,
+                    "bigtiff": "IF_SAFER",
+                }
+                if compression != "none":
+                    profile["compress"] = compression
+                    profile["predictor"] = 3 if output_dtype.kind == "f" else 2
+                    profile["num_threads"] = worker_threads
+
+                file_descriptor, temp_name = tempfile.mkstemp(
+                    prefix=f".{output_path.stem}_",
+                    suffix=".tif",
+                    dir=str(folder),
                 )
-                destination.update_tags(ns="rio_overview", resampling=overview_resampling_name)
+                os.close(file_descriptor)
+                temp_path = Path(temp_name)
+                with rasterio.open(temp_path, "w", **profile) as destination:
+                    for row_offset in range(0, reference.height, IO_WINDOW_SIZE):
+                        for column_offset in range(0, reference.width, IO_WINDOW_SIZE):
+                            window = Window(
+                                column_offset,
+                                row_offset,
+                                min(IO_WINDOW_SIZE, reference.width - column_offset),
+                                min(IO_WINDOW_SIZE, reference.height - row_offset),
+                            )
+                            stack_array = np.empty(
+                                (3, int(window.height), int(window.width)), dtype=output_dtype
+                            )
+                            for output_index, band in enumerate((2, 3, 4)):
+                                read_sources[band].read(
+                                    1,
+                                    window=window,
+                                    out=stack_array[output_index],
+                                )
+                            destination.write(stack_array, window=window)
+                    for index, band in enumerate((2, 3, 4), start=1):
+                        destination.set_band_description(index, f"Band {band}")
+                    destination.update_tags(
+                        source_bands="2,3,4",
+                        stack_order="Band 2, Band 3, Band 4",
+                        pyramid_resampling=overview_resampling_name,
+                    )
+                    valid_levels = [
+                        level for level in overview_levels
+                        if max(reference.width, reference.height) >= level
+                    ]
+                    if valid_levels:
+                        destination.build_overviews(
+                            valid_levels,
+                            getattr(Resampling, overview_resampling_name),
+                        )
+                        destination.update_tags(ns="rio_overview", resampling=overview_resampling_name)
 
         os.replace(temp_path, output_path)
         temp_path = None
         overview_text = ", ".join(map(str, valid_levels)) if valid_levels else "none (image too small)"
         return "Completed", f"Saved {output_path.name}; overview levels: {overview_text}"
     finally:
-        for dataset in datasets.values():
-            dataset.close()
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
 
@@ -325,7 +342,7 @@ def main() -> None:
 
     st.markdown('<div class="step-card"><b>2. Review the bands and processing options</b></div>', unsafe_allow_html=True)
     with st.expander("Processing options", expanded=True):
-        option_columns = st.columns(3)
+        option_columns = st.columns(4)
         with option_columns[0]:
             resampling_name = st.selectbox(
                 "Resampling if grids differ",
@@ -340,7 +357,20 @@ def main() -> None:
                 index=0,
             )
         with option_columns[2]:
-            compression = st.selectbox("GeoTIFF compression", ["deflate", "lzw", "zstd", "none"], index=0)
+            compression = st.selectbox(
+                "GeoTIFF compression",
+                ["deflate", "lzw", "zstd", "none"],
+                index=0,
+                help="ZSTD is often faster and smaller; DEFLATE is more widely supported by older GIS software.",
+            )
+        with option_columns[3]:
+            thread_choice = st.selectbox(
+                "Processing threads",
+                ["All CPU cores", "4", "2", "1"],
+                index=0,
+                help="Uses GDAL multithreading for raster reads, compression, alignment, and pyramid generation.",
+            )
+            worker_threads = "ALL_CPUS" if thread_choice == "All CPU cores" else thread_choice
         overview_levels = st.multiselect("Overview pyramid levels", OVERVIEW_CHOICES, default=OVERVIEW_CHOICES)
         nodata_input = st.text_input(
             "Output NoData override (optional)",
@@ -412,6 +442,7 @@ def main() -> None:
             summaries: list[tuple[str, str, str]] = []
             for index, record in enumerate(ready_records, start=1):
                 scene = _display_name(record)
+                scene_started = time.perf_counter()
                 progress.progress((index - 1) / len(ready_records), text=f"Processing {scene} ({index}/{len(ready_records)})…")
                 try:
                     status, details = _stack_scene(
@@ -420,11 +451,13 @@ def main() -> None:
                         overview_resampling_name=overview_resampling_name,
                         overview_levels=overview_levels,
                         compression=compression,
+                        worker_threads=worker_threads,
                         overwrite=overwrite,
                         nodata_override=nodata_override,
                     )
                 except Exception as error:
                     status, details = "Failed", str(error)
+                details += f" ({time.perf_counter() - scene_started:.1f}s)"
                 summaries.append((scene, status, details))
                 progress.progress(index / len(ready_records), text=f"Finished {scene} ({index}/{len(ready_records)})")
             with results_area:
