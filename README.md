@@ -6,14 +6,14 @@ A local Streamlit app for batch-stacking raster bands **2, 3, and 4** into three
 
 - Scans one or more selected folders, optionally including their subfolders.
 - Groups files in the same folder when their names match apart from a recognized band marker, such as `B2`, `B02`, `BAND_2`, or `Band2`.
-- Writes each stack beside its source bands as `<scene>_B2_B3_B4_stack.tif`.
+- Writes each stack beside its source bands using the folder name, such as `R2F01NOV2026080619009400045SSANSTUC00GTDB.tif`.
 - Keeps stack order fixed as Band 2, Band 3, Band 4.
 - Uses Band 2's grid as the output grid and aligns Bands 3 and 4 when their georeferencing differs.
 - Builds internal GeoTIFF overviews at the selected pyramid levels.
 - Uses larger buffered writes and GDAL multithreading to speed up stacking and overview generation.
-- Skips an existing output unless **Overwrite an existing** is enabled.
+- Skips an existing folder-named output unless overwrite is enabled.
 
-Incomplete groups and groups with multiple files for the same band are shown for review and not processed.
+Incomplete groups and groups with multiple files for the same band are shown for review and not processed. If one folder contains multiple complete band sets, the app flags the filename conflict so the sets cannot overwrite one another.
 
 ## Run on Windows
 
