@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import time
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -76,7 +77,10 @@ def scan_folders(folder_paths: list[Path], recursive: bool) -> list[dict[str, An
             if not path.is_file() or path.suffix.casefold() not in SUPPORTED_EXTENSIONS:
                 continue
             resolved_path = path.resolve()
-            if resolved_path.stem.casefold().endswith("_b2_b3_b4_stack"):
+            if (
+                resolved_path.stem.casefold().endswith("_b2_b3_b4_stack")
+                or resolved_path.stem.casefold() == path.parent.name.casefold()
+            ):
                 continue
             file_key = str(resolved_path).casefold()
             if file_key in seen_files:
@@ -103,6 +107,21 @@ def scan_folders(folder_paths: list[Path], recursive: bool) -> list[dict[str, An
 def _display_name(record: dict[str, Any]) -> str:
     group = record["group_name"].replace("_band", "").strip("_")
     return group or Path(record["folder"]).name or "raster"
+
+
+def _output_filename(record: dict[str, Any]) -> str:
+    folder = Path(record["folder"])
+    name = folder.name or folder.drive.rstrip("\\/: ") or "raster"
+    return f"{name}.tif"
+
+
+def _folders_with_output_conflicts(records: list[dict[str, Any]]) -> set[str]:
+    ready_folder_counts = Counter(
+        record["folder"].casefold()
+        for record in records
+        if _scene_status(record) == "Ready"
+    )
+    return {folder for folder, count in ready_folder_counts.items() if count > 1}
 
 
 def _scene_status(record: dict[str, Any]) -> str:
@@ -153,7 +172,7 @@ def _stack_scene(
     nodata_override: float | None,
 ) -> tuple[str, str]:
     folder = Path(record["folder"])
-    output_path = folder / f"{_display_name(record)}_B2_B3_B4_stack.tif"
+    output_path = folder / _output_filename(record)
     if output_path.exists() and not overwrite:
         return "Skipped", f"Already exists: {output_path}"
 
@@ -415,7 +434,7 @@ def main() -> None:
 
     st.markdown(
         '<div class="step-card"><b>1. Choose source folders</b><br>'
-        'Select multiple folders together, or paste a list of folder paths. Each output is saved beside its matching bands.</div>',
+        'Select multiple folders together, or paste a list of folder paths. Each stack is saved beside its bands using the folder name.</div>',
         unsafe_allow_html=True,
     )
     folder_button, folder_hint = st.columns([1, 4])
@@ -477,7 +496,7 @@ def main() -> None:
             placeholder="Leave blank to use Band 2's NoData value",
             help="Set a value such as -9999 when aligned bands may leave pixels outside the Band 2 footprint.",
         )
-        overwrite = st.checkbox("Overwrite an existing *_B2_B3_B4_stack.tif", value=False)
+        overwrite = st.checkbox("Overwrite an existing folder-name .tif", value=False)
 
     col_scan, col_spacer = st.columns([1, 4])
     with col_scan:
@@ -500,14 +519,24 @@ def main() -> None:
     records = st.session_state.scan_records
     scan_is_current = st.session_state.scan_signature == signature and bool(records)
     if scan_is_current:
-        ready_records = [record for record in records if _scene_status(record) == "Ready"]
+        conflicting_folders = _folders_with_output_conflicts(records)
+        ready_records = [
+            record
+            for record in records
+            if _scene_status(record) == "Ready"
+            and record["folder"].casefold() not in conflicting_folders
+        ]
         rows = []
         for record in records:
+            status = _scene_status(record)
+            if status == "Ready" and record["folder"].casefold() in conflicting_folders:
+                status = "Multiple complete scenes in folder; output names would collide"
             rows.append(
                 {
-                    "Status": _scene_status(record),
+                    "Status": status,
                     "Folder": record["folder"],
                     "Scene": _display_name(record),
+                    "Output file": _output_filename(record),
                     "Band 2": Path(record["bands"][2][0]).name if record["bands"][2] else "—",
                     "Band 3": Path(record["bands"][3][0]).name if record["bands"][3] else "—",
                     "Band 4": Path(record["bands"][4][0]).name if record["bands"][4] else "—",
@@ -518,6 +547,11 @@ def main() -> None:
         metric_columns[1].metric("Ready to stack", len(ready_records))
         metric_columns[2].metric("Need attention", len(records) - len(ready_records))
         st.dataframe(rows, use_container_width=True, hide_index=True)
+        if conflicting_folders:
+            st.warning(
+                "More than one complete band set was found in at least one folder. "
+                "Because the output name must match the folder name, split those scenes into separate folders before processing."
+            )
         if not ready_records:
             st.info("No complete, unambiguous Band 2 / Band 3 / Band 4 sets were found.")
         if not overview_levels:
