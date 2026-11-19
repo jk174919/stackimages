@@ -305,53 +305,74 @@ def _choose_folders() -> list[str]:
         if not options:
             options = [parent_path]
 
-        selected_folders: list[Path] = []
-        dialog = tk.Toplevel(root)
-        dialog.title("Select all source folders")
-        dialog.geometry("760x520")
-        dialog.transient(root)
-        dialog.grab_set()
+        root.deiconify()
+        root.title("Select source folders")
+        root.geometry("780x560")
+        root.minsize(580, 360)
+        root.attributes("-topmost", True)
         tk.Label(
-            dialog,
-            text="All listed folders are selected by default. Use Ctrl/Shift to adjust the selection.",
+            root,
+            text="Check every folder to include. All listed folders start selected.",
             anchor="w",
             justify="left",
         ).pack(fill="x", padx=14, pady=(14, 4))
-        tk.Label(dialog, text=f"Parent: {parent_path}", anchor="w", justify="left").pack(
+        tk.Label(root, text=f"Common parent: {parent_path}", anchor="w", justify="left").pack(
             fill="x", padx=14, pady=(0, 8)
         )
-        list_frame = tk.Frame(dialog)
-        list_frame.pack(fill="both", expand=True, padx=14, pady=4)
-        scrollbar = tk.Scrollbar(list_frame)
-        scrollbar.pack(side="right", fill="y")
-        listbox = tk.Listbox(
-            list_frame,
-            selectmode=tk.EXTENDED,
-            exportselection=False,
-            yscrollcommand=scrollbar.set,
-        )
-        for path in options:
-            listbox.insert(tk.END, str(path))
-        listbox.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=listbox.yview)
-        listbox.selection_set(0, tk.END)
 
-        button_frame = tk.Frame(dialog)
+        list_frame = tk.Frame(root)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=4)
+        canvas = tk.Canvas(list_frame, highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        folder_frame = tk.Frame(canvas)
+        folder_frame.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        frame_window = canvas.create_window((0, 0), window=folder_frame, anchor="nw")
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(frame_window, width=event.width),
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        folder_checks: list[tuple[Path, tk.BooleanVar]] = []
+        for path in options:
+            checked = tk.BooleanVar(master=root, value=True)
+            tk.Checkbutton(
+                folder_frame,
+                text=str(path),
+                variable=checked,
+                anchor="w",
+                justify="left",
+                wraplength=690,
+            ).pack(fill="x", anchor="w", padx=6, pady=2)
+            folder_checks.append((path, checked))
+
+        selected_folders: list[str] = []
+        button_frame = tk.Frame(root)
         button_frame.pack(fill="x", padx=14, pady=(8, 14))
 
-        def select_all() -> None:
-            listbox.selection_set(0, tk.END)
+        def set_all(value: bool) -> None:
+            for _path, checked in folder_checks:
+                checked.set(value)
 
         def use_selection() -> None:
-            selected_folders[:] = [options[index] for index in listbox.curselection()]
-            dialog.destroy()
+            selected_folders.extend(str(path) for path, checked in folder_checks if checked.get())
+            root.destroy()
 
-        tk.Button(button_frame, text="Select all", command=select_all).pack(side="left")
+        def cancel_selection() -> None:
+            root.destroy()
+
+        tk.Button(button_frame, text="Select all", command=lambda: set_all(True)).pack(side="left")
+        tk.Button(button_frame, text="Clear all", command=lambda: set_all(False)).pack(side="left", padx=(8, 0))
         tk.Button(button_frame, text="Use selected folders", command=use_selection).pack(side="right")
-        tk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
-        root.wait_window(dialog)
-        root.destroy()
-        return [str(path) for path in selected_folders]
+        tk.Button(button_frame, text="Cancel", command=cancel_selection).pack(side="right", padx=(0, 8))
+        root.protocol("WM_DELETE_WINDOW", cancel_selection)
+        root.mainloop()
+        return selected_folders
     except Exception:
         if root is not None:
             try:
@@ -409,7 +430,7 @@ def main() -> None:
                 st.rerun()
     with folder_hint:
         st.caption(
-            "Choose one common parent, then keep all folders selected or adjust the list. For folders in separate locations, paste all paths below, one per line."
+            "Choose a common parent, check all folders to include in one window, or paste multiple full paths below, one per line."
         )
     source_text = st.text_area(
         "Source folders — one path per line",
