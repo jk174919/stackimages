@@ -31,7 +31,7 @@ For double-click setup, run `install_windows.bat` once and then `run_windows.bat
 
 If you use Conda, create the environment with `conda env create -f environment.yml`, then start the app with `conda run -n raster-band-stack-pyramids streamlit run app.py`.
 
-The app opens in your browser. Choose several folders in sequence with the folder picker and cancel when finished, or paste multiple folder paths in the source-folder box, one per line. The picker requires running the app on the same PC that stores the imagery. Each stack is written beside its matching source bands, including when several folders are processed in one batch.
+The app opens in your browser. Click **Choose folders** and select a common parent once; a multi-select list opens with its source folders selected together. Use Ctrl/Shift to adjust the list. If your folders are in separate locations, paste all their paths into the source-folder box, one per line. The picker requires running the app on the same PC that stores the imagery. Each stack is written beside its matching source bands, including when several folders are processed in one batch.
 
 ## Options
 
