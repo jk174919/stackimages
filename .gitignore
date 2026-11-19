@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.streamlit/secrets.toml
+*.tif
+*.tiff
+*.jp2
+*.img
+*.vrt
+*.ovr
+
