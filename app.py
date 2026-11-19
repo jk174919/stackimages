@@ -155,7 +155,7 @@ def _stack_scene(
     folder = Path(record["folder"])
     output_path = folder / f"{_display_name(record)}_B2_B3_B4_stack.tif"
     if output_path.exists() and not overwrite:
-        return "Skipped", f"Already exists: {output_path.name}"
+        return "Skipped", f"Already exists: {output_path}"
 
     temp_path: Path | None = None
     try:
@@ -268,13 +268,13 @@ def _stack_scene(
         os.replace(temp_path, output_path)
         temp_path = None
         overview_text = ", ".join(map(str, valid_levels)) if valid_levels else "none (image too small)"
-        return "Completed", f"Saved {output_path.name}; overview levels: {overview_text}"
+        return "Completed", f"Saved to {output_path}; overview levels: {overview_text}"
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
 
 
-def _choose_folder() -> str:
+def _choose_folders() -> list[str]:
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -282,11 +282,21 @@ def _choose_folder() -> str:
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        selected = filedialog.askdirectory(parent=root, title="Select a folder containing raster bands")
+        selected_folders: list[str] = []
+        while True:
+            selected = filedialog.askdirectory(
+                parent=root,
+                title="Select a source folder (Cancel when you have finished adding folders)",
+                mustexist=True,
+            )
+            if not selected:
+                break
+            if selected not in selected_folders:
+                selected_folders.append(selected)
         root.destroy()
-        return selected
+        return selected_folders
     except Exception:
-        return ""
+        return []
 
 
 def main() -> None:
@@ -320,23 +330,31 @@ def main() -> None:
     if "scan_signature" not in st.session_state:
         st.session_state.scan_signature = None
 
-    st.markdown('<div class="step-card"><b>1. Choose source folders</b><br>Each output is saved beside its source bands.</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="step-card"><b>1. Choose source folders</b><br>'
+        'Add several folders in one session. Each output is saved in the same folder as its matching bands.</div>',
+        unsafe_allow_html=True,
+    )
     folder_button, folder_hint = st.columns([1, 4])
     with folder_button:
-        if st.button("＋ Add folder", use_container_width=True):
-            selected = _choose_folder()
-            if selected:
+        if st.button("＋ Choose folders", use_container_width=True):
+            selected_folders = _choose_folders()
+            if selected_folders:
                 existing = st.session_state.source_folders_text.strip()
-                st.session_state.source_folders_text = f"{existing}\n{selected}".strip()
+                st.session_state.source_folders_text = "\n".join(
+                    [existing, *selected_folders] if existing else selected_folders
+                )
                 st.rerun()
     with folder_hint:
-        st.caption("Add one or more folder paths below, one per line. The folder picker works when Streamlit runs on your PC.")
+        st.caption(
+            "Choose folders in sequence and cancel when finished, or paste multiple full paths below, one per line. "
+            "The picker works when Streamlit runs on your PC."
+        )
     source_text = st.text_area(
-        "Folders to scan",
+        "Source folders — one path per line",
         key="source_folders_text",
-        height=115,
+        height=145,
         placeholder="C:\\imagery\\scene_01\nD:\\satellite\\scene_02",
-        label_visibility="collapsed",
     )
     recursive = st.toggle("Also scan subfolders", value=True, help="When enabled, matching rasters in nested folders are included.")
 
@@ -383,6 +401,7 @@ def main() -> None:
     with col_scan:
         scan_clicked = st.button("Scan for band sets", type="primary", use_container_width=True)
     folder_paths = _parse_paths(source_text)
+    st.caption(f"{len(folder_paths)} source folder(s) listed. Stacks are saved beside each matched band set.")
     signature = (tuple(str(path.resolve()) for path in folder_paths), recursive)
     if scan_clicked:
         invalid = [str(path) for path in folder_paths if not path.is_dir()]
