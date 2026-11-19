@@ -275,6 +275,7 @@ def _stack_scene(
 
 
 def _choose_folders() -> list[str]:
+    root = None
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -282,20 +283,81 @@ def _choose_folders() -> list[str]:
         root = tk.Tk()
         root.withdraw()
         root.attributes("-topmost", True)
-        selected_folders: list[str] = []
-        while True:
-            selected = filedialog.askdirectory(
-                parent=root,
-                title="Select a source folder (Cancel when you have finished adding folders)",
-                mustexist=True,
-            )
-            if not selected:
-                break
-            if selected not in selected_folders:
-                selected_folders.append(selected)
+        common_parent = filedialog.askdirectory(
+            parent=root,
+            title="Choose the parent folder containing your source folders",
+            mustexist=True,
+        )
+        if not common_parent:
+            root.destroy()
+            return []
+
+        parent_path = Path(common_parent)
+        child_folders = sorted(
+            (path for path in parent_path.iterdir() if path.is_dir()),
+            key=lambda path: path.name.casefold(),
+        )
+        parent_has_rasters = any(
+            path.is_file() and path.suffix.casefold() in SUPPORTED_EXTENSIONS
+            for path in parent_path.iterdir()
+        )
+        options = ([parent_path] if parent_has_rasters or not child_folders else []) + child_folders
+        if not options:
+            options = [parent_path]
+
+        selected_folders: list[Path] = []
+        dialog = tk.Toplevel(root)
+        dialog.title("Select all source folders")
+        dialog.geometry("760x520")
+        dialog.transient(root)
+        dialog.grab_set()
+        tk.Label(
+            dialog,
+            text="All listed folders are selected by default. Use Ctrl/Shift to adjust the selection.",
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=14, pady=(14, 4))
+        tk.Label(dialog, text=f"Parent: {parent_path}", anchor="w", justify="left").pack(
+            fill="x", padx=14, pady=(0, 8)
+        )
+        list_frame = tk.Frame(dialog)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=4)
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side="right", fill="y")
+        listbox = tk.Listbox(
+            list_frame,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            yscrollcommand=scrollbar.set,
+        )
+        for path in options:
+            listbox.insert(tk.END, str(path))
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=listbox.yview)
+        listbox.selection_set(0, tk.END)
+
+        button_frame = tk.Frame(dialog)
+        button_frame.pack(fill="x", padx=14, pady=(8, 14))
+
+        def select_all() -> None:
+            listbox.selection_set(0, tk.END)
+
+        def use_selection() -> None:
+            selected_folders[:] = [options[index] for index in listbox.curselection()]
+            dialog.destroy()
+
+        tk.Button(button_frame, text="Select all", command=select_all).pack(side="left")
+        tk.Button(button_frame, text="Use selected folders", command=use_selection).pack(side="right")
+        tk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
+        root.wait_window(dialog)
         root.destroy()
-        return selected_folders
+        return [str(path) for path in selected_folders]
     except Exception:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
         return []
 
 
@@ -332,7 +394,7 @@ def main() -> None:
 
     st.markdown(
         '<div class="step-card"><b>1. Choose source folders</b><br>'
-        'Add several folders in one session. Each output is saved in the same folder as its matching bands.</div>',
+        'Select multiple folders together, or paste a list of folder paths. Each output is saved beside its matching bands.</div>',
         unsafe_allow_html=True,
     )
     folder_button, folder_hint = st.columns([1, 4])
@@ -347,8 +409,7 @@ def main() -> None:
                 st.rerun()
     with folder_hint:
         st.caption(
-            "Choose folders in sequence and cancel when finished, or paste multiple full paths below, one per line. "
-            "The picker works when Streamlit runs on your PC."
+            "Choose one common parent, then keep all folders selected or adjust the list. For folders in separate locations, paste all paths below, one per line."
         )
     source_text = st.text_area(
         "Source folders — one path per line",
