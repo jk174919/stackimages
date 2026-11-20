@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import stat
 import tempfile
 import time
+import zipfile
 from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 import numpy as np
@@ -170,9 +174,10 @@ def _stack_scene(
     worker_threads: str,
     overwrite: bool,
     nodata_override: float | None,
+    output_path_override: Path | None = None,
 ) -> tuple[str, str]:
     folder = Path(record["folder"])
-    output_path = folder / _output_filename(record)
+    output_path = output_path_override or (folder / _output_filename(record))
     if output_path.exists() and not overwrite:
         return "Skipped", f"Already exists: {output_path}"
 
@@ -243,7 +248,7 @@ def _stack_scene(
                 file_descriptor, temp_name = tempfile.mkstemp(
                     prefix=f".{output_path.stem}_",
                     suffix=".tif",
-                    dir=str(folder),
+                    dir=str(output_path.parent),
                 )
                 os.close(file_descriptor)
                 temp_path = Path(temp_name)
@@ -291,6 +296,107 @@ def _stack_scene(
     finally:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
+
+
+def _extract_zip_safely(zip_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    extraction_root = destination.resolve()
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            normalized_name = info.filename.replace("\\", "/")
+            member = PurePosixPath(normalized_name)
+            if (
+                member.is_absolute()
+                or any(part == ".." or ":" in part for part in member.parts)
+            ):
+                raise ValueError(f"Unsafe path in ZIP archive: {info.filename}")
+            if not member.parts:
+                if info.is_dir():
+                    continue
+                raise ValueError(f"ZIP member has an empty path: {info.filename}")
+
+            target = destination.joinpath(*member.parts)
+            resolved_target = target.resolve()
+            if resolved_target != extraction_root and extraction_root not in resolved_target.parents:
+                raise ValueError(f"ZIP member escapes its extraction folder: {info.filename}")
+
+            mode = info.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"Symbolic links are not supported in ZIP archives: {info.filename}")
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info, "r") as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+def _process_zip_archive(
+    zip_path: Path,
+    *,
+    resampling_name: str,
+    overview_resampling_name: str,
+    overview_levels: list[int],
+    compression: str,
+    worker_threads: str,
+    overwrite: bool,
+    nodata_override: float | None,
+) -> tuple[str, str]:
+    zip_path = zip_path.resolve()
+    if not zip_path.is_file() or zip_path.suffix.casefold() != ".zip":
+        raise ValueError(f"Not a ZIP file: {zip_path}")
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"The file is not a valid ZIP archive: {zip_path.name}")
+
+    output_folder = zip_path.parent / zip_path.stem
+    output_path = output_folder / f"{zip_path.stem}.tif"
+    if output_folder.exists() and not output_folder.is_dir():
+        raise ValueError(f"Cannot create output folder because this path is a file: {output_folder}")
+    if output_path.exists() and not output_path.is_file():
+        raise ValueError(f"The expected stack path is already a folder: {output_path}")
+
+    if output_folder.is_dir():
+        extra_items = [
+            item for item in output_folder.iterdir()
+            if item.resolve() != output_path.resolve()
+        ]
+        if extra_items:
+            raise ValueError(
+                f"Output folder already contains other files. Move them out to keep only the stack: {output_folder}"
+            )
+    if output_path.exists() and not overwrite:
+        return "Skipped", f"Stack already exists: {output_path}"
+
+    output_folder_created = not output_folder.exists()
+    try:
+        with tempfile.TemporaryDirectory(prefix="raster_stack_zip_") as temp_dir:
+            extraction_folder = Path(temp_dir)
+            _extract_zip_safely(zip_path, extraction_folder)
+            records = scan_folders([extraction_folder], recursive=True)
+            ready_records = [record for record in records if _scene_status(record) == "Ready"]
+            if not ready_records:
+                raise ValueError("No complete, unambiguous Band 2 / Band 3 / Band 4 set was found in this ZIP.")
+            if len(ready_records) > 1:
+                raise ValueError(
+                    f"Found {len(ready_records)} complete band sets. Put one scene in each ZIP so the output can use the ZIP name."
+                )
+
+            output_folder.mkdir(parents=True, exist_ok=True)
+            return _stack_scene(
+                ready_records[0],
+                resampling_name=resampling_name,
+                overview_resampling_name=overview_resampling_name,
+                overview_levels=overview_levels,
+                compression=compression,
+                worker_threads=worker_threads,
+                overwrite=overwrite,
+                nodata_override=nodata_override,
+                output_path_override=output_path,
+            )
+    finally:
+        if output_folder_created and output_folder.is_dir() and not any(output_folder.iterdir()):
+            output_folder.rmdir()
 
 
 def _choose_folders() -> list[str]:
@@ -401,6 +507,31 @@ def _choose_folders() -> list[str]:
         return []
 
 
+def _choose_zip_folder() -> str:
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        selected = filedialog.askdirectory(
+            parent=root,
+            title="Select the folder containing the ZIP archives",
+            mustexist=True,
+        )
+        root.destroy()
+        return selected
+    except Exception:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        return []
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, page_icon="🛰️", layout="wide")
     st.markdown(
@@ -431,6 +562,8 @@ def main() -> None:
         st.session_state.scan_records = []
     if "scan_signature" not in st.session_state:
         st.session_state.scan_signature = None
+    if "zip_folder_path" not in st.session_state:
+        st.session_state.zip_folder_path = ""
 
     st.markdown(
         '<div class="step-card"><b>1. Choose source folders</b><br>'
@@ -498,6 +631,15 @@ def main() -> None:
         )
         overwrite = st.checkbox("Overwrite an existing folder-name .tif", value=False)
 
+    nodata_override = None
+    nodata_is_valid = True
+    if nodata_input.strip():
+        try:
+            nodata_override = float(nodata_input.strip())
+        except ValueError:
+            nodata_is_valid = False
+            st.error("The NoData override must be numeric.")
+
     col_scan, col_spacer = st.columns([1, 4])
     with col_scan:
         scan_clicked = st.button("Scan for band sets", type="primary", use_container_width=True)
@@ -556,19 +698,10 @@ def main() -> None:
             st.info("No complete, unambiguous Band 2 / Band 3 / Band 4 sets were found.")
         if not overview_levels:
             st.warning("Select at least one overview level to build pyramids.")
-        if nodata_input.strip():
-            try:
-                nodata_override = float(nodata_input.strip())
-            except ValueError:
-                nodata_override = None
-                st.error("The NoData override must be numeric.")
-        else:
-            nodata_override = None
-
         process_clicked = st.button(
             "Stack bands and build pyramids",
             type="primary",
-            disabled=not ready_records or not overview_levels or (bool(nodata_input.strip()) and nodata_override is None),
+            disabled=not ready_records or not overview_levels or not nodata_is_valid,
             use_container_width=True,
         )
         if process_clicked:
@@ -617,6 +750,98 @@ def main() -> None:
         st.info("The folder list or scan setting changed. Scan again to refresh the band list.")
     elif st.session_state.scan_signature is not None and not records:
         st.info("The scan completed, but no files with recognizable Band 2, 3, or 4 names were found.")
+
+    with st.expander("Process every ZIP file in a folder", expanded=True):
+        st.caption(
+            "Choose one folder containing ZIP archives. Each ZIP is extracted to temporary storage; "
+            "a sibling output folder named after the ZIP will contain only the same-named stack."
+        )
+        zip_picker, zip_hint = st.columns([1, 4])
+        with zip_picker:
+            if st.button("Choose ZIP folder", use_container_width=True):
+                selected_folder = _choose_zip_folder()
+                if selected_folder:
+                    st.session_state.zip_folder_path = selected_folder
+                    st.rerun()
+        with zip_hint:
+            st.caption("Only .zip files directly inside this folder are included.")
+        zip_folder_text = st.text_input(
+            "Folder containing ZIP files",
+            key="zip_folder_path",
+            placeholder="C:\\imagery\\zip_batches",
+        )
+        zip_folder_value = zip_folder_text.strip().strip('"').strip("'")
+        zip_folder = Path(zip_folder_value).expanduser() if zip_folder_value else None
+        zip_files = (
+            sorted(
+                (path for path in zip_folder.iterdir() if path.is_file() and path.suffix.casefold() == ".zip"),
+                key=lambda path: path.name.casefold(),
+            )
+            if zip_folder is not None and zip_folder.is_dir()
+            else []
+        )
+        if zip_folder_value:
+            if zip_folder is None or not zip_folder.is_dir():
+                st.error("The ZIP folder path does not exist.")
+            elif not zip_files:
+                st.info("No .zip files were found directly inside this folder.")
+            else:
+                st.caption(f"Found {len(zip_files)} ZIP archive(s). One stack will be created for each valid archive.")
+                st.dataframe(
+                    [
+                        {
+                            "ZIP file": path.name,
+                            "Output folder": path.parent / path.stem,
+                            "Stack image": f"{path.stem}.tif",
+                        }
+                        for path in zip_files
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        overwrite_zip = st.checkbox("Overwrite an existing ZIP stack image", value=False, key="overwrite_zip")
+        process_zips = st.button(
+            "Process all ZIP files in this folder",
+            type="primary",
+            disabled=not zip_files or not overview_levels or not nodata_is_valid,
+            use_container_width=True,
+        )
+        if process_zips:
+            progress = st.progress(0, text="Starting ZIP batch…")
+            zip_summaries: list[tuple[str, str, str]] = []
+            for index, zip_path in enumerate(zip_files, start=1):
+                started = time.perf_counter()
+                progress.progress((index - 1) / len(zip_files), text=f"Processing {zip_path.name} ({index}/{len(zip_files)})…")
+                try:
+                    status, details = _process_zip_archive(
+                        zip_path,
+                        resampling_name=resampling_name,
+                        overview_resampling_name=overview_resampling_name,
+                        overview_levels=overview_levels,
+                        compression=compression,
+                        worker_threads=worker_threads,
+                        overwrite=overwrite_zip,
+                        nodata_override=nodata_override,
+                    )
+                except Exception as error:
+                    status, details = "Failed", str(error)
+                details += f" ({time.perf_counter() - started:.1f}s)"
+                zip_summaries.append((zip_path.name, status, details))
+                progress.progress(index / len(zip_files), text=f"Finished {zip_path.name} ({index}/{len(zip_files)})")
+            st.markdown("### ZIP batch results")
+            st.dataframe(
+                [{"ZIP file": name, "Result": status, "Details": details} for name, status, details in zip_summaries],
+                use_container_width=True,
+                hide_index=True,
+            )
+            completed = sum(status == "Completed" for _, status, _ in zip_summaries)
+            failed = sum(status == "Failed" for _, status, _ in zip_summaries)
+            skipped = sum(status == "Skipped" for _, status, _ in zip_summaries)
+            summary = f"ZIP batch finished: {completed} created, {skipped} skipped, {failed} failed."
+            if failed:
+                st.warning(summary)
+            else:
+                st.success(summary)
 
     st.caption("Supported naming examples: *_B2.tif, *_B02.jp2, *_BAND_3.tif, and Band4.tif. Raster grids are aligned to Band 2 when needed.")
 
