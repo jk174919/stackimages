@@ -15,6 +15,12 @@ A local Streamlit app for batch-stacking raster bands **2, 3, and 4** into three
 
 Incomplete groups and groups with multiple files for the same band are shown for review and not processed. If one folder contains multiple complete band sets, the app flags the filename conflict so the sets cannot overwrite one another.
 
+## Batch process ZIP archives
+
+Open **Process every ZIP file in a folder**, choose or paste the folder containing the archives, then click **Process all ZIP files in this folder**. The app processes every `.zip` directly inside that folder. Each archive should contain one complete, unambiguous Band 2 / Band 3 / Band 4 scene.
+
+For `scene_name.zip`, the result is created beside the archive as `scene_name/scene_name.tif`. The archive is extracted to temporary storage, so the output folder contains only the stacked GeoTIFF. If that output folder already contains other files, the app reports an error and leaves them untouched. Existing stack images are skipped unless overwrite is enabled.
+
 ## Run on Windows
 
 Use Python 3.10 or newer. Open PowerShell in this folder and run:
