@@ -772,17 +772,22 @@ def main() -> None:
         )
         zip_folder_value = zip_folder_text.strip().strip('"').strip("'")
         zip_folder = Path(zip_folder_value).expanduser() if zip_folder_value else None
-        zip_files = (
-            sorted(
-                (path for path in zip_folder.iterdir() if path.is_file() and path.suffix.casefold() == ".zip"),
-                key=lambda path: path.name.casefold(),
-            )
-            if zip_folder is not None and zip_folder.is_dir()
-            else []
-        )
+        zip_files: list[Path] = []
+        zip_folder_read_error: str | None = None
+        zip_folder_exists = zip_folder is not None and zip_folder.is_dir()
+        if zip_folder_exists and zip_folder is not None:
+            try:
+                zip_files = sorted(
+                    (path for path in zip_folder.iterdir() if path.is_file() and path.suffix.casefold() == ".zip"),
+                    key=lambda path: path.name.casefold(),
+                )
+            except OSError as error:
+                zip_folder_read_error = str(error)
         if zip_folder_value:
-            if zip_folder is None or not zip_folder.is_dir():
+            if not zip_folder_exists:
                 st.error("The ZIP folder path does not exist.")
+            elif zip_folder_read_error:
+                st.error(f"The ZIP folder could not be read: {zip_folder_read_error}")
             elif not zip_files:
                 st.info("No .zip files were found directly inside this folder.")
             else:
@@ -791,7 +796,7 @@ def main() -> None:
                     [
                         {
                             "ZIP file": path.name,
-                            "Output folder": path.parent / path.stem,
+                            "Output folder": str(path.parent / path.stem),
                             "Stack image": f"{path.stem}.tif",
                         }
                         for path in zip_files
